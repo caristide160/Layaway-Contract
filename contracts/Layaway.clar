@@ -17,11 +17,22 @@
 (define-constant ERR_ESCROW_NOT_FOUND (err u115))
 (define-constant ERR_ESCROW_ALREADY_RELEASED (err u116))
 (define-constant ERR_INSUFFICIENT_ESCROW_BALANCE (err u117))
+(define-constant ERR_TEMPLATE_NOT_FOUND (err u118))
+(define-constant ERR_INSTALLMENT_NOT_FOUND (err u119))
+(define-constant ERR_INSTALLMENT_ALREADY_PAID (err u120))
+(define-constant ERR_WRONG_INSTALLMENT_AMOUNT (err u121))
+(define-constant ERR_INSTALLMENT_NOT_DUE (err u122))
+(define-constant ERR_TEMPLATE_ALREADY_EXISTS (err u123))
+(define-constant ERR_INVALID_INSTALLMENT_COUNT (err u124))
+(define-constant ERR_INSTALLMENT_OVERDUE (err u125))
 
 (define-data-var next-item-id uint u1)
 (define-data-var next-dispute-id uint u1)
 (define-data-var dispute-period uint u144)
 (define-data-var arbitration-fee uint u1000000)
+(define-data-var next-template-id uint u1)
+(define-data-var late-payment-penalty-rate uint u5)
+(define-data-var early-payment-bonus-rate uint u2)
 
 (define-map layaway-items
   { item-id: uint }
@@ -83,6 +94,57 @@
     cases-handled: uint,
     reputation-score: uint,
     registered-at: uint
+  }
+)
+
+(define-map payment-templates
+  { template-id: uint }
+  {
+    seller: principal,
+    template-name: (string-ascii 50),
+    total-price: uint,
+    installment-count: uint,
+    installment-amount: uint,
+    first-payment-due: uint,
+    payment-interval: uint,
+    late-penalty-enabled: bool,
+    early-bonus-enabled: bool,
+    active: bool,
+    created-at: uint
+  }
+)
+
+(define-map layaway-schedules
+  { item-id: uint }
+  {
+    template-id: uint,
+    current-installment: uint,
+    completed-installments: uint,
+    next-due-date: uint,
+    total-penalties: uint,
+    total-bonuses: uint
+  }
+)
+
+(define-map installment-payments
+  { item-id: uint, installment-number: uint }
+  {
+    amount-due: uint,
+    amount-paid: uint,
+    due-date: uint,
+    paid-date: (optional uint),
+    penalty-applied: uint,
+    bonus-applied: uint,
+    status: (string-ascii 20)
+  }
+)
+
+(define-map template-usage
+  { template-id: uint }
+  {
+    times-used: uint,
+    total-value: uint,
+    completion-rate: uint
   }
 )
 
@@ -501,3 +563,284 @@
     ERR_DISPUTE_NOT_FOUND
   )
 )
+
+(define-public (create-payment-template (template-name (string-ascii 50)) (total-price uint) (installment-count uint) (first-payment-due uint) (payment-interval uint) (late-penalty-enabled bool) (early-bonus-enabled bool))
+  (let
+    (
+      (template-id (var-get next-template-id))
+      (current-block stacks-block-height)
+      (installment-amount (/ total-price installment-count))
+    )
+    (asserts! (> total-price u0) ERR_INVALID_AMOUNT)
+    (asserts! (and (> installment-count u0) (<= installment-count u12)) ERR_INVALID_INSTALLMENT_COUNT)
+    (asserts! (> first-payment-due current-block) ERR_PAYMENT_DEADLINE_PASSED)
+    (asserts! (> payment-interval u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-none (map-get? payment-templates { template-id: template-id })) ERR_TEMPLATE_ALREADY_EXISTS)
+    
+    (map-set payment-templates
+      { template-id: template-id }
+      {
+        seller: tx-sender,
+        template-name: template-name,
+        total-price: total-price,
+        installment-count: installment-count,
+        installment-amount: installment-amount,
+        first-payment-due: first-payment-due,
+        payment-interval: payment-interval,
+        late-penalty-enabled: late-penalty-enabled,
+        early-bonus-enabled: early-bonus-enabled,
+        active: true,
+        created-at: current-block
+      }
+    )
+    
+    (map-set template-usage
+      { template-id: template-id }
+      {
+        times-used: u0,
+        total-value: u0,
+        completion-rate: u0
+      }
+    )
+    
+    (var-set next-template-id (+ template-id u1))
+    (ok template-id)
+  )
+)
+
+(define-public (create-layaway-with-template (buyer principal) (item-name (string-ascii 50)) (template-id uint))
+  (let
+    (
+      (template-data (unwrap! (map-get? payment-templates { template-id: template-id }) ERR_TEMPLATE_NOT_FOUND))
+      (item-id (var-get next-item-id))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get seller template-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (get active template-data) ERR_TEMPLATE_NOT_FOUND)
+    (asserts! (is-none (map-get? layaway-items { item-id: item-id })) ERR_ITEM_ALREADY_EXISTS)
+    
+    (map-set layaway-items
+      { item-id: item-id }
+      {
+        seller: tx-sender,
+        buyer: buyer,
+        item-name: item-name,
+        total-price: (get total-price template-data),
+        amount-paid: u0,
+        payment-deadline: (+ (get first-payment-due template-data) (* (get payment-interval template-data) (get installment-count template-data))),
+        claimed: false,
+        created-at: current-block
+      }
+    )
+    
+    (map-set layaway-schedules
+      { item-id: item-id }
+      {
+        template-id: template-id,
+        current-installment: u1,
+        completed-installments: u0,
+        next-due-date: (get first-payment-due template-data),
+        total-penalties: u0,
+        total-bonuses: u0
+      }
+    )
+    
+    (map-set installment-payments { item-id: item-id, installment-number: u1 } {
+      amount-due: (get installment-amount template-data),
+      amount-paid: u0,
+      due-date: (get first-payment-due template-data),
+      paid-date: none,
+      penalty-applied: u0,
+      bonus-applied: u0,
+      status: "pending"
+    })
+    
+    (map-set user-items { user: buyer, item-id: item-id } { exists: true })
+    (map-set user-items { user: tx-sender, item-id: item-id } { exists: true })
+    
+    (map-set template-usage
+      { template-id: template-id }
+      (merge (unwrap-panic (map-get? template-usage { template-id: template-id })) {
+        times-used: (+ (get times-used (unwrap-panic (map-get? template-usage { template-id: template-id }))) u1),
+        total-value: (+ (get total-value (unwrap-panic (map-get? template-usage { template-id: template-id }))) (get total-price template-data))
+      })
+    )
+    
+    (var-set next-item-id (+ item-id u1))
+    (ok item-id)
+  )
+)
+
+(define-public (make-installment-payment (item-id uint) (installment-number uint))
+  (let
+    (
+      (item-data (unwrap! (map-get? layaway-items { item-id: item-id }) ERR_ITEM_NOT_FOUND))
+      (schedule-data (unwrap! (map-get? layaway-schedules { item-id: item-id }) ERR_ITEM_NOT_FOUND))
+      (installment-data (unwrap! (map-get? installment-payments { item-id: item-id, installment-number: installment-number }) ERR_INSTALLMENT_NOT_FOUND))
+      (template-data (unwrap! (map-get? payment-templates { template-id: (get template-id schedule-data) }) ERR_TEMPLATE_NOT_FOUND))
+      (current-block stacks-block-height)
+      (is-overdue (> current-block (get due-date installment-data)))
+      (is-early (< current-block (get due-date installment-data)))
+      (penalty-amount (if (and is-overdue (get late-penalty-enabled template-data)) 
+        (/ (* (get amount-due installment-data) (var-get late-payment-penalty-rate)) u100) 
+        u0))
+      (bonus-amount (if (and is-early (get early-bonus-enabled template-data)) 
+        (/ (* (get amount-due installment-data) (var-get early-payment-bonus-rate)) u100) 
+        u0))
+      (total-payment (+ (get amount-due installment-data) penalty-amount))
+      (effective-payment (- total-payment bonus-amount))
+    )
+    (asserts! (is-eq tx-sender (get buyer item-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get claimed item-data)) ERR_ITEM_ALREADY_CLAIMED)
+    (asserts! (is-eq (get status installment-data) "pending") ERR_INSTALLMENT_ALREADY_PAID)
+    (asserts! (is-eq installment-number (get current-installment schedule-data)) ERR_INSTALLMENT_NOT_DUE)
+    
+    (try! (stx-transfer? effective-payment tx-sender (get seller item-data)))
+    
+    (map-set installment-payments
+      { item-id: item-id, installment-number: installment-number }
+      (merge installment-data {
+        amount-paid: effective-payment,
+        paid-date: (some current-block),
+        penalty-applied: penalty-amount,
+        bonus-applied: bonus-amount,
+        status: "paid"
+      })
+    )
+    
+    (map-set layaway-schedules
+      { item-id: item-id }
+      (merge schedule-data {
+        current-installment: (+ (get current-installment schedule-data) u1),
+        completed-installments: (+ (get completed-installments schedule-data) u1),
+        next-due-date: (if (< (+ installment-number u1) (get installment-count template-data))
+          (+ (get due-date installment-data) (get payment-interval template-data))
+          (get due-date installment-data)),
+        total-penalties: (+ (get total-penalties schedule-data) penalty-amount),
+        total-bonuses: (+ (get total-bonuses schedule-data) bonus-amount)
+      })
+    )
+    
+    (map-set layaway-items
+      { item-id: item-id }
+      (merge item-data {
+        amount-paid: (+ (get amount-paid item-data) effective-payment)
+      })
+    )
+    
+    (ok effective-payment)
+  )
+)
+
+(define-public (toggle-template-status (template-id uint))
+  (let
+    (
+      (template-data (unwrap! (map-get? payment-templates { template-id: template-id }) ERR_TEMPLATE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get seller template-data)) ERR_NOT_AUTHORIZED)
+    
+    (map-set payment-templates
+      { template-id: template-id }
+      (merge template-data { active: (not (get active template-data)) })
+    )
+    
+    (ok (not (get active template-data)))
+  )
+)
+
+(define-public (set-penalty-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (<= new-rate u20) ERR_INVALID_AMOUNT)
+    (var-set late-payment-penalty-rate new-rate)
+    (ok true)
+  )
+)
+
+(define-public (set-bonus-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (<= new-rate u10) ERR_INVALID_AMOUNT)
+    (var-set early-payment-bonus-rate new-rate)
+    (ok true)
+  )
+)
+
+(define-read-only (get-payment-template (template-id uint))
+  (map-get? payment-templates { template-id: template-id })
+)
+
+(define-read-only (get-layaway-schedule (item-id uint))
+  (map-get? layaway-schedules { item-id: item-id })
+)
+
+(define-read-only (get-installment-payment (item-id uint) (installment-number uint))
+  (map-get? installment-payments { item-id: item-id, installment-number: installment-number })
+)
+
+(define-read-only (get-template-usage (template-id uint))
+  (map-get? template-usage { template-id: template-id })
+)
+
+(define-read-only (get-next-template-id)
+  (ok (var-get next-template-id))
+)
+
+(define-read-only (get-penalty-rate)
+  (ok (var-get late-payment-penalty-rate))
+)
+
+(define-read-only (get-bonus-rate)
+  (ok (var-get early-payment-bonus-rate))
+)
+
+(define-read-only (is-installment-overdue (item-id uint) (installment-number uint))
+  (match (map-get? installment-payments { item-id: item-id, installment-number: installment-number })
+    installment-data 
+      (ok (and 
+        (> stacks-block-height (get due-date installment-data))
+        (is-eq (get status installment-data) "pending")
+      ))
+    ERR_INSTALLMENT_NOT_FOUND
+  )
+)
+
+(define-read-only (get-payment-schedule-summary (item-id uint))
+  (match (map-get? layaway-schedules { item-id: item-id })
+    schedule-data
+      (let
+        (
+          (template-data (unwrap! (map-get? payment-templates { template-id: (get template-id schedule-data) }) ERR_TEMPLATE_NOT_FOUND))
+          (completion-percentage (/ (* (get completed-installments schedule-data) u100) (get installment-count template-data)))
+        )
+        (ok {
+          total-installments: (get installment-count template-data),
+          completed: (get completed-installments schedule-data),
+          remaining: (- (get installment-count template-data) (get completed-installments schedule-data)),
+          completion-percentage: completion-percentage,
+          next-due: (get next-due-date schedule-data),
+          total-penalties: (get total-penalties schedule-data),
+          total-bonuses: (get total-bonuses schedule-data)
+        })
+      )
+    ERR_ITEM_NOT_FOUND
+  )
+)
+
+(define-read-only (can-make-installment-payment (item-id uint) (installment-number uint))
+  (match (map-get? installment-payments { item-id: item-id, installment-number: installment-number })
+    installment-data
+      (match (map-get? layaway-schedules { item-id: item-id })
+        schedule-data
+          (ok (and
+            (is-eq (get status installment-data) "pending")
+            (is-eq installment-number (get current-installment schedule-data))
+          ))
+        ERR_ITEM_NOT_FOUND
+      )
+    ERR_INSTALLMENT_NOT_FOUND
+  )
+)
+
+
+
