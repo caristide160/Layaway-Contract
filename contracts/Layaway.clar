@@ -25,8 +25,18 @@
 (define-constant ERR_TEMPLATE_ALREADY_EXISTS (err u123))
 (define-constant ERR_INVALID_INSTALLMENT_COUNT (err u124))
 (define-constant ERR_INSTALLMENT_OVERDUE (err u125))
+(define-constant ERR_GIFT_CARD_NOT_FOUND (err u126))
+(define-constant ERR_GIFT_CARD_EXPIRED (err u127))
+(define-constant ERR_GIFT_CARD_INSUFFICIENT_BALANCE (err u128))
+(define-constant ERR_GIFT_CARD_ALREADY_USED (err u129))
+(define-constant ERR_GIFT_CARD_NOT_TRANSFERABLE (err u130))
+(define-constant ERR_VOUCHER_NOT_FOUND (err u131))
+(define-constant ERR_VOUCHER_ITEM_MISMATCH (err u132))
+(define-constant ERR_VOUCHER_ALREADY_REDEEMED (err u133))
+(define-constant GIFT_CARD_MAX_VALIDITY_PERIOD u52560)  ;; ~1 year in blocks
 
 (define-data-var next-item-id uint u1)
+(define-data-var next-gift-card-id uint u1)
 (define-data-var next-dispute-id uint u1)
 (define-data-var dispute-period uint u144)
 (define-data-var arbitration-fee uint u1000000)
@@ -145,6 +155,47 @@
     times-used: uint,
     total-value: uint,
     completion-rate: uint
+  }
+)
+
+;; Gift Card System Maps
+(define-map gift-cards
+  { gift-card-id: uint }
+  {
+    creator: principal,
+    holder: principal,
+    balance: uint,
+    original-amount: uint,
+    created-at: uint,
+    expires-at: uint,
+    transferable: bool,
+    message: (string-ascii 100),
+    active: bool
+  }
+)
+
+(define-map item-vouchers
+  { voucher-id: uint }
+  {
+    creator: principal,
+    item-id: uint,
+    voucher-amount: uint,
+    redeemed: bool,
+    redeemed-by: (optional principal),
+    redeemed-at: (optional uint),
+    created-at: uint,
+    expires-at: uint,
+    message: (string-ascii 100)
+  }
+)
+
+(define-map gift-card-usage
+  { gift-card-id: uint, usage-id: uint }
+  {
+    item-id: uint,
+    amount-used: uint,
+    used-by: principal,
+    used-at: uint
   }
 )
 
@@ -839,6 +890,333 @@
         ERR_ITEM_NOT_FOUND
       )
     ERR_INSTALLMENT_NOT_FOUND
+  )
+)
+
+;; ===== GIFT CARD & VOUCHER SYSTEM =====
+
+;; Create gift card that can be used for layaway payments
+(define-public (create-gift-card 
+  (recipient principal) 
+  (amount uint) 
+  (validity-period uint) 
+  (transferable bool) 
+  (message (string-ascii 100)))
+  (let (
+    (gift-card-id (var-get next-gift-card-id))
+    (current-block stacks-block-height)
+    (expires-at (+ current-block (if (<= validity-period GIFT_CARD_MAX_VALIDITY_PERIOD) validity-period GIFT_CARD_MAX_VALIDITY_PERIOD)))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> validity-period u0) ERR_INVALID_AMOUNT)
+    
+    ;; Transfer STX to contract for gift card funding
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set gift-cards
+      { gift-card-id: gift-card-id }
+      {
+        creator: tx-sender,
+        holder: recipient,
+        balance: amount,
+        original-amount: amount,
+        created-at: current-block,
+        expires-at: expires-at,
+        transferable: transferable,
+        message: message,
+        active: true
+      }
+    )
+    
+    (var-set next-gift-card-id (+ gift-card-id u1))
+    (ok gift-card-id)
+  )
+)
+
+;; Transfer gift card to another user (if transferable)
+(define-public (transfer-gift-card (gift-card-id uint) (new-recipient principal))
+  (let (
+    (gift-card-data (unwrap! (map-get? gift-cards { gift-card-id: gift-card-id }) ERR_GIFT_CARD_NOT_FOUND))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-eq tx-sender (get holder gift-card-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (get transferable gift-card-data) ERR_GIFT_CARD_NOT_TRANSFERABLE)
+    (asserts! (get active gift-card-data) ERR_GIFT_CARD_ALREADY_USED)
+    (asserts! (<= current-block (get expires-at gift-card-data)) ERR_GIFT_CARD_EXPIRED)
+    (asserts! (> (get balance gift-card-data) u0) ERR_GIFT_CARD_INSUFFICIENT_BALANCE)
+    
+    (map-set gift-cards
+      { gift-card-id: gift-card-id }
+      (merge gift-card-data { holder: new-recipient })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Use gift card for layaway payment
+(define-public (redeem-gift-card (gift-card-id uint) (item-id uint) (amount uint))
+  (let (
+    (gift-card-data (unwrap! (map-get? gift-cards { gift-card-id: gift-card-id }) ERR_GIFT_CARD_NOT_FOUND))
+    (item-data (unwrap! (map-get? layaway-items { item-id: item-id }) ERR_ITEM_NOT_FOUND))
+    (current-block stacks-block-height)
+    (new-balance (- (get balance gift-card-data) amount))
+    (new-amount-paid (+ (get amount-paid item-data) amount))
+  )
+    (asserts! (or 
+      (is-eq tx-sender (get holder gift-card-data)) 
+      (is-eq tx-sender (get buyer item-data))
+    ) ERR_NOT_AUTHORIZED)
+    (asserts! (get active gift-card-data) ERR_GIFT_CARD_ALREADY_USED)
+    (asserts! (<= current-block (get expires-at gift-card-data)) ERR_GIFT_CARD_EXPIRED)
+    (asserts! (>= (get balance gift-card-data) amount) ERR_GIFT_CARD_INSUFFICIENT_BALANCE)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= new-amount-paid (get total-price item-data)) ERR_PAYMENT_TOO_LARGE)
+    (asserts! (not (get claimed item-data)) ERR_ITEM_ALREADY_CLAIMED)
+    (asserts! (<= current-block (get payment-deadline item-data)) ERR_PAYMENT_DEADLINE_PASSED)
+    
+    ;; Transfer STX from contract to seller
+    (try! (as-contract (stx-transfer? amount tx-sender (get seller item-data))))
+    
+    ;; Update gift card balance
+    (map-set gift-cards
+      { gift-card-id: gift-card-id }
+      (merge gift-card-data {
+        balance: new-balance,
+        active: (> new-balance u0)
+      })
+    )
+    
+    ;; Update layaway item payment
+    (map-set layaway-items
+      { item-id: item-id }
+      (merge item-data { amount-paid: new-amount-paid })
+    )
+    
+    ;; Record gift card usage
+    (map-set gift-card-usage
+      { gift-card-id: gift-card-id, usage-id: current-block }
+      {
+        item-id: item-id,
+        amount-used: amount,
+        used-by: tx-sender,
+        used-at: current-block
+      }
+    )
+    
+    (ok new-amount-paid)
+  )
+)
+
+;; Create voucher for specific layaway item
+(define-public (create-item-voucher 
+  (item-id uint) 
+  (voucher-amount uint) 
+  (validity-period uint) 
+  (message (string-ascii 100)))
+  (let (
+    (voucher-id (var-get next-gift-card-id))  ;; Reuse gift card ID counter
+    (item-data (unwrap! (map-get? layaway-items { item-id: item-id }) ERR_ITEM_NOT_FOUND))
+    (current-block stacks-block-height)
+    (expires-at (+ current-block (if (<= validity-period GIFT_CARD_MAX_VALIDITY_PERIOD) validity-period GIFT_CARD_MAX_VALIDITY_PERIOD)))
+  )
+    (asserts! (or 
+      (is-eq tx-sender (get seller item-data)) 
+      (is-eq tx-sender (get buyer item-data))
+    ) ERR_NOT_AUTHORIZED)
+    (asserts! (> voucher-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= voucher-amount (- (get total-price item-data) (get amount-paid item-data))) ERR_PAYMENT_TOO_LARGE)
+    (asserts! (> validity-period u0) ERR_INVALID_AMOUNT)
+    (asserts! (not (get claimed item-data)) ERR_ITEM_ALREADY_CLAIMED)
+    
+    ;; Transfer STX to contract for voucher funding
+    (try! (stx-transfer? voucher-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set item-vouchers
+      { voucher-id: voucher-id }
+      {
+        creator: tx-sender,
+        item-id: item-id,
+        voucher-amount: voucher-amount,
+        redeemed: false,
+        redeemed-by: none,
+        redeemed-at: none,
+        created-at: current-block,
+        expires-at: expires-at,
+        message: message
+      }
+    )
+    
+    (var-set next-gift-card-id (+ voucher-id u1))
+    (ok voucher-id)
+  )
+)
+
+;; Redeem voucher for specific item
+(define-public (redeem-voucher (voucher-id uint))
+  (let (
+    (voucher-data (unwrap! (map-get? item-vouchers { voucher-id: voucher-id }) ERR_VOUCHER_NOT_FOUND))
+    (item-data (unwrap! (map-get? layaway-items { item-id: (get item-id voucher-data) }) ERR_ITEM_NOT_FOUND))
+    (current-block stacks-block-height)
+    (new-amount-paid (+ (get amount-paid item-data) (get voucher-amount voucher-data)))
+  )
+    (asserts! (is-eq tx-sender (get buyer item-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get redeemed voucher-data)) ERR_VOUCHER_ALREADY_REDEEMED)
+    (asserts! (<= current-block (get expires-at voucher-data)) ERR_GIFT_CARD_EXPIRED)
+    (asserts! (not (get claimed item-data)) ERR_ITEM_ALREADY_CLAIMED)
+    (asserts! (<= current-block (get payment-deadline item-data)) ERR_PAYMENT_DEADLINE_PASSED)
+    
+    ;; Transfer STX from contract to seller
+    (try! (as-contract (stx-transfer? (get voucher-amount voucher-data) tx-sender (get seller item-data))))
+    
+    ;; Mark voucher as redeemed
+    (map-set item-vouchers
+      { voucher-id: voucher-id }
+      (merge voucher-data {
+        redeemed: true,
+        redeemed-by: (some tx-sender),
+        redeemed-at: (some current-block)
+      })
+    )
+    
+    ;; Update layaway item payment
+    (map-set layaway-items
+      { item-id: (get item-id voucher-data) }
+      (merge item-data { amount-paid: new-amount-paid })
+    )
+    
+    (ok new-amount-paid)
+  )
+)
+
+;; Cash out remaining gift card balance (emergency function)
+(define-public (cash-out-gift-card (gift-card-id uint))
+  (let (
+    (gift-card-data (unwrap! (map-get? gift-cards { gift-card-id: gift-card-id }) ERR_GIFT_CARD_NOT_FOUND))
+    (current-block stacks-block-height)
+  )
+    (asserts! (is-eq tx-sender (get holder gift-card-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (get active gift-card-data) ERR_GIFT_CARD_ALREADY_USED)
+    (asserts! (> (get balance gift-card-data) u0) ERR_GIFT_CARD_INSUFFICIENT_BALANCE)
+    
+    ;; Return remaining balance to holder
+    (try! (as-contract (stx-transfer? (get balance gift-card-data) tx-sender (get holder gift-card-data))))
+    
+    ;; Deactivate gift card
+    (map-set gift-cards
+      { gift-card-id: gift-card-id }
+      (merge gift-card-data {
+        balance: u0,
+        active: false
+      })
+    )
+    
+    (ok (get balance gift-card-data))
+  )
+)
+
+;; ===== GIFT CARD & VOUCHER READ-ONLY FUNCTIONS =====
+
+;; Get gift card details
+(define-read-only (get-gift-card (gift-card-id uint))
+  (map-get? gift-cards { gift-card-id: gift-card-id })
+)
+
+;; Get voucher details
+(define-read-only (get-voucher (voucher-id uint))
+  (map-get? item-vouchers { voucher-id: voucher-id })
+)
+
+;; Check if gift card is valid and usable
+(define-read-only (is-gift-card-valid (gift-card-id uint))
+  (match (map-get? gift-cards { gift-card-id: gift-card-id })
+    gift-card-data
+      (ok (and 
+        (get active gift-card-data)
+        (<= stacks-block-height (get expires-at gift-card-data))
+        (> (get balance gift-card-data) u0)
+      ))
+    ERR_GIFT_CARD_NOT_FOUND
+  )
+)
+
+;; Check if voucher is valid and redeemable
+(define-read-only (is-voucher-valid (voucher-id uint))
+  (match (map-get? item-vouchers { voucher-id: voucher-id })
+    voucher-data
+      (ok (and 
+        (not (get redeemed voucher-data))
+        (<= stacks-block-height (get expires-at voucher-data))
+      ))
+    ERR_VOUCHER_NOT_FOUND
+  )
+)
+
+;; Get gift card balance and status
+(define-read-only (get-gift-card-balance (gift-card-id uint))
+  (match (map-get? gift-cards { gift-card-id: gift-card-id })
+    gift-card-data
+      (ok {
+        balance: (get balance gift-card-data),
+        original-amount: (get original-amount gift-card-data),
+        active: (get active gift-card-data),
+        expired: (> stacks-block-height (get expires-at gift-card-data))
+      })
+    ERR_GIFT_CARD_NOT_FOUND
+  )
+)
+
+;; Get gift card usage history
+(define-read-only (get-gift-card-usage (gift-card-id uint) (usage-id uint))
+  (map-get? gift-card-usage { gift-card-id: gift-card-id, usage-id: usage-id })
+)
+
+;; Get next gift card ID
+(define-read-only (get-next-gift-card-id)
+  (ok (var-get next-gift-card-id))
+)
+
+;; Calculate how much of layaway item can be paid with gift card
+(define-read-only (calculate-max-gift-card-payment (gift-card-id uint) (item-id uint))
+  (match (map-get? gift-cards { gift-card-id: gift-card-id })
+    gift-card-data
+      (match (map-get? layaway-items { item-id: item-id })
+        item-data
+          (let (
+            (remaining-balance (- (get total-price item-data) (get amount-paid item-data)))
+            (gift-card-balance (get balance gift-card-data))
+          )
+            (ok (if (<= remaining-balance gift-card-balance) remaining-balance gift-card-balance))
+          )
+        ERR_ITEM_NOT_FOUND
+      )
+    ERR_GIFT_CARD_NOT_FOUND
+  )
+)
+
+;; Check if gift card can be used for specific item
+(define-read-only (can-use-gift-card-for-item (gift-card-id uint) (item-id uint) (amount uint))
+  (match (map-get? gift-cards { gift-card-id: gift-card-id })
+    gift-card-data
+      (match (map-get? layaway-items { item-id: item-id })
+        item-data
+          (let (
+            (current-block stacks-block-height)
+            (remaining-balance (- (get total-price item-data) (get amount-paid item-data)))
+          )
+            (ok (and
+              (get active gift-card-data)
+              (<= current-block (get expires-at gift-card-data))
+              (<= current-block (get payment-deadline item-data))
+              (not (get claimed item-data))
+              (>= (get balance gift-card-data) amount)
+              (<= amount remaining-balance)
+              (> amount u0)
+            ))
+          )
+        ERR_ITEM_NOT_FOUND
+      )
+    ERR_GIFT_CARD_NOT_FOUND
   )
 )
 
